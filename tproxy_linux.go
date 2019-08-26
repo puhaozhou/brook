@@ -1,20 +1,33 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"time"
 
 	cache "github.com/patrickmn/go-cache"
-	"github.com/txthinking/brook/plugin"
 	"github.com/txthinking/brook/tproxy"
 	"github.com/txthinking/socks5"
 )
 
-// Tproxy
+// Tproxy.
 type Tproxy struct {
 	TCPAddr       *net.TCPAddr
 	UDPAddr       *net.UDPAddr
@@ -27,10 +40,9 @@ type Tproxy struct {
 	TCPDeadline   int
 	TCPTimeout    int
 	UDPDeadline   int
-	TokenGetter   plugin.TokenGetter
 }
 
-// NewTproxy
+// NewTproxy.
 func NewTproxy(addr, remote, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Tproxy, error) {
 	taddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -48,7 +60,7 @@ func NewTproxy(addr, remote, password string, tcpTimeout, tcpDeadline, udpDeadli
 	if err != nil {
 		return nil, err
 	}
-	cs := cache.New(60*time.Minute, 10*time.Minute)
+	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
 	s := &Tproxy{
 		Password:      []byte(password),
 		TCPAddr:       taddr,
@@ -63,12 +75,7 @@ func NewTproxy(addr, remote, password string, tcpTimeout, tcpDeadline, udpDeadli
 	return s, nil
 }
 
-// SetToken set token plugin
-func (s *Tproxy) SetTokenGetter(token plugin.TokenGetter) {
-	s.TokenGetter = token
-}
-
-// Run server
+// Run server.
 func (s *Tproxy) ListenAndServe() error {
 	errch := make(chan error)
 	go func() {
@@ -80,7 +87,7 @@ func (s *Tproxy) ListenAndServe() error {
 	return <-errch
 }
 
-// RunTCPServer starts tcp server
+// RunTCPServer starts tcp server.
 func (s *Tproxy) RunTCPServer() error {
 	var err error
 	s.TCPListen, err = tproxy.ListenTCP("tcp", s.TCPAddr)
@@ -115,7 +122,7 @@ func (s *Tproxy) RunTCPServer() error {
 	return nil
 }
 
-// RunUDPServer starts udp server
+// RunUDPServer starts udp server.
 func (s *Tproxy) RunUDPServer() error {
 	var err error
 	s.UDPConn, err = tproxy.ListenUDP("udp", s.UDPAddr)
@@ -142,7 +149,7 @@ func (s *Tproxy) RunUDPServer() error {
 	return nil
 }
 
-// Shutdown server
+// Shutdown server.
 func (s *Tproxy) Shutdown() error {
 	var err, err1 error
 	if s.TCPListen != nil {
@@ -157,7 +164,7 @@ func (s *Tproxy) Shutdown() error {
 	return err1
 }
 
-// TCPHandle handle request
+// TCPHandle handles request.
 func (s *Tproxy) TCPHandle(c *net.TCPConn) error {
 	tmp, err := tproxy.DialTCP("tcp", s.RemoteTCPAddr.String())
 	if err != nil {
@@ -192,19 +199,6 @@ func (s *Tproxy) TCPHandle(c *net.TCPConn) error {
 	rawaddr = append(rawaddr, a)
 	rawaddr = append(rawaddr, address...)
 	rawaddr = append(rawaddr, port...)
-	if s.TokenGetter != nil {
-		t, err := s.TokenGetter.Get()
-		if err != nil {
-			return err
-		}
-		if len(t) == 0 {
-			return errors.New("Miss Token")
-		}
-		bb := make([]byte, 2)
-		binary.BigEndian.PutUint16(bb, uint16(len(t)))
-		t = append(bb, t...)
-		rawaddr = append(t, rawaddr...)
-	}
 	n, err = WriteTo(rc, rawaddr, k, n, true)
 	if err != nil {
 		return err
@@ -273,19 +267,6 @@ func (s *Tproxy) UDPHandle(addr, daddr *net.UDPAddr, b []byte) error {
 	b = append(rawaddr, b...)
 
 	send := func(ue *UDPExchange, data []byte) error {
-		if s.TokenGetter != nil {
-			t, err := s.TokenGetter.Get()
-			if err != nil {
-				return err
-			}
-			if len(t) == 0 {
-				return errors.New("Miss Token")
-			}
-			bb := make([]byte, 2)
-			binary.BigEndian.PutUint16(bb, uint16(len(t)))
-			t = append(bb, t...)
-			data = append(t, data...)
-		}
 		cd, err := Encrypt(s.Password, data)
 		if err != nil {
 			return err
@@ -313,14 +294,16 @@ func (s *Tproxy) UDPHandle(addr, daddr *net.UDPAddr, b []byte) error {
 	}
 	c, err := tproxy.DialUDP("udp", daddr, addr)
 	if err != nil {
-		// TODO repleace with IP spoofing
-		return nil
+		rc.Close()
+		return errors.New(fmt.Sprintf("src: %s dst: %s %s", daddr.String(), addr.String(), err.Error()))
 	}
 	ue = &UDPExchange{
 		RemoteConn: rc,
 		LocalConn:  c,
 	}
 	if err := send(ue, b); err != nil {
+		ue.RemoteConn.Close()
+		ue.LocalConn.Close()
 		return err
 	}
 	s.UDPExchanges.Set(ue.LocalConn.RemoteAddr().String(), ue, cache.DefaultExpiration)
@@ -328,6 +311,7 @@ func (s *Tproxy) UDPHandle(addr, daddr *net.UDPAddr, b []byte) error {
 		defer func() {
 			s.UDPExchanges.Delete(ue.LocalConn.RemoteAddr().String())
 			ue.RemoteConn.Close()
+			ue.LocalConn.Close()
 		}()
 		var b [65536]byte
 		for {
@@ -340,7 +324,7 @@ func (s *Tproxy) UDPHandle(addr, daddr *net.UDPAddr, b []byte) error {
 			if err != nil {
 				break
 			}
-			_, _, _, data, err := Decrypt(s.Password, b[0:n], nil)
+			_, _, _, data, err := Decrypt(s.Password, b[0:n])
 			if err != nil {
 				break
 			}
